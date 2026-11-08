@@ -76,6 +76,7 @@ class SparseKVCacheManager:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         sparse_context_len: int,
         simt_ops_path: str = "",
+        simt_verify_width: int = 1,
     ) -> None:
         enable_memory_saver = False
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -86,6 +87,15 @@ class SparseKVCacheManager:
         # configured capacity when row 0 is reserved for graph padding.
         self.size = int(req_to_token_pool.req_to_token.shape[0])
         self.max_context_len = req_to_token_pool.max_context_len
+        if simt_ops_path:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                SIMT_KV_PAGE_SIZE,
+            )
+
+            # A whole request starts at a page boundary in the Host block table.
+            self.max_context_len = (
+                (self.max_context_len + SIMT_KV_PAGE_SIZE - 1) // SIMT_KV_PAGE_SIZE
+            ) * SIMT_KV_PAGE_SIZE
         self.sparse_context_len = int(sparse_context_len)
         if self.sparse_context_len <= 0:
             raise ValueError(
@@ -165,7 +175,7 @@ class SparseKVCacheManager:
         self.current_req_indices_cpu = None
 
         if simt_ops_path:
-            self.simt_lru = SparseKVSimtLRU(self)
+            self.simt_lru = SparseKVSimtLRU(self, simt_verify_width)
         self._install_req_alloc_hook(req_to_token_pool)
 
     def _init_compact_cache(self, memory_saver_adapter) -> None:
@@ -451,13 +461,9 @@ class SparseKVCacheManager:
                 )
 
             dst_index = (req_ids * self.max_context_len + token_pos).contiguous()
-            valid_req = (
-                (req_ids > 0) & (req_ids < self.size)
-                if self.simt_lru is not None
-                else (forward_batch.seq_lens != 1) & (req_ids >= 0)
-            )
             valid_mask = (
-                valid_req
+                (forward_batch.seq_lens != 1)
+                & (req_ids >= 0)
                 & (cache_loc >= 0)
                 & (token_pos >= 0)
                 & (token_pos < self.max_context_len)

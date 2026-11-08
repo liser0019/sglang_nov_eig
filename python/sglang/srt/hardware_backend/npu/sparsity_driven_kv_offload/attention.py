@@ -61,6 +61,16 @@ def forward_sparsity_driven_kv_offload(
     k_nope = k.view(-1, layer.tp_k_head_num, backend.kv_lora_rank).contiguous()
     k_pe = k_rope.view(-1, layer.tp_k_head_num, backend.qk_rope_head_dim).contiguous()
     sparse_kv_manager = _get_sparse_kv_manager(backend)
+    if sparse_kv_manager.simt_lru is not None and (
+        forward_batch.forward_mode.is_decode()
+        or forward_batch.forward_mode.is_target_verify()
+    ):
+        if not save_kv_cache:
+            raise ValueError("SIMT sparse KV requires the current query's KV for writeback")
+        return _forward_simt_decode(
+            backend, layer, forward_batch, q_nope, q_pe, k_nope, k_pe, topk_indices
+        )
+
     stream = torch.npu.current_stream(backend.device)
 
     if save_kv_cache:
@@ -114,12 +124,6 @@ def forward_sparsity_driven_kv_offload(
             layer,
             actual_seq_qlen,
             actual_seq_lengths_kv,
-        )
-    elif (
-        forward_batch.forward_mode.is_decode() and sparse_kv_manager.simt_lru is not None
-    ):
-        return _forward_simt_decode(
-            backend, layer, forward_batch, q_nope, q_pe, topk_indices
         )
     elif forward_batch.forward_mode.is_decode():
         batch_size = forward_batch.batch_size
@@ -324,18 +328,25 @@ def forward_sparsity_driven_kv_offload(
     return attn_out
 
 
-def _forward_simt_decode(backend, layer, forward_batch, q_nope, q_pe, topk_indices):
+def _forward_simt_decode(
+    backend, layer, forward_batch, q_nope, q_pe, k_nope, k_pe, topk_indices
+):
     manager = _get_sparse_kv_manager(backend)
     lru = manager.simt_lru
-    rows = forward_batch.batch_size
+    layer_idx = layer.layer_id - manager.start_layer
     resident_nope, resident_rope, slots = lru.plan_and_load(
-        layer.layer_id - manager.start_layer,
+        layer_idx,
         forward_batch,
         normalize_batch_topk_indices(topk_indices),
+        k_nope,
+        k_pe,
+        manager.host_kv_buffer[layer_idx],
+        manager.dev_ptr_list[layer_idx],
     )
+    rows = slots.shape[0]
 
     # Plan already checked causal visibility. Indices now address physical
-    # resident slots; the KV length in BSND bounds that storage, not the prompt.
+    # resident slots; the length bounds the resident storage for each query.
     # A5 SFA stops at -1. Plan can leave holes when it rejects an input
     # position, so pack valid slots in Indexer order and leave a -1 suffix.
     valid = slots >= 0
@@ -347,24 +358,33 @@ def _forward_simt_decode(backend, layer, forward_batch, q_nope, q_pe, topk_indic
     sparse_indices = torch.empty_like(slots).scatter_(1, destinations, slots)
     empty = valid_count.squeeze(1) == 0
     sparse_indices[:, 0] = torch.where(empty, 0, sparse_indices[:, 0])
+    # Each query has its own sparse index list. The page table can point
+    # several queries at one resident row when the joint Plan fits.
+    nope_pages = resident_nope.view(-1, lru.block_size, 1, backend.kv_lora_rank)
+    rope_pages = resident_rope.view(-1, lru.block_size, 1, backend.qk_rope_head_dim)
     ret = torch_npu.npu_sparse_flash_attention(
-        q_nope.reshape(rows, 1, -1, backend.kv_lora_rank),
-        resident_nope,
-        resident_nope,
-        sparse_indices.view(rows, 1, 1, lru.topk),
+        q_nope[:rows].reshape(rows, -1, backend.kv_lora_rank),
+        nope_pages,
+        nope_pages,
+        sparse_indices.unsqueeze(1),
         layer.scaling,
-        actual_seq_lengths_query=lru.query_lens[:rows],
+        actual_seq_lengths_query=lru.cu_query_lens[:rows],
         actual_seq_lengths_kv=lru.slot_lens[:rows],
-        query_rope=q_pe.reshape(rows, 1, -1, backend.qk_rope_head_dim),
-        key_rope=resident_rope,
+        block_table=lru.resident_blocks[:rows],
+        query_rope=q_pe[:rows].reshape(rows, -1, backend.qk_rope_head_dim),
+        key_rope=rope_pages,
         sparse_block_size=1,
-        layout_query="BSND",
-        layout_kv="BSND",
+        layout_query="TND",
+        layout_kv="PA_BSND",
         sparse_mode=0,
         attention_mode=2,
         return_softmax_lse=False,
     )
     out = ret[0] if isinstance(ret, tuple) else ret
-    out = out[:, :, : layer.tp_q_head_num, :]
-    out = out.reshape(rows, layer.tp_q_head_num * backend.kv_lora_rank)
-    return out.masked_fill(empty.unsqueeze(1), 0)
+    out = out[:, : layer.tp_q_head_num, :].reshape(
+        rows, layer.tp_q_head_num * backend.kv_lora_rank
+    )
+    out = out.masked_fill(empty.unsqueeze(1), 0)
+    if rows < q_nope.shape[0]:
+        out = torch.cat((out, out.new_zeros((q_nope.shape[0] - rows, out.shape[1]))))
+    return out

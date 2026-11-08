@@ -283,6 +283,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
         )
 
+        simt_offload = (
+            not kvc.is_draft_worker
+            and kvc.use_mla_backend
+            and is_deepseek_dsa(kvc.model_config.hf_config)
+            and envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
+            and envs.SGLANG_NPU_SPARSE_KV_SIMT_OPS_PATH.get()
+        )
+        if simt_offload:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                get_simt_resident_budget,
+            )
+
+            max_requests = get_schedule().max_running_requests
+            local_requests = max(1, max_requests // kvc.attn_dp_size)
+            self._fixed_overhead_bytes += get_simt_resident_budget(
+                kvc.model_config, num_layers, local_requests + 1
+            )
+
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
         if (
@@ -320,10 +338,19 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    draft_kv_size = (
-                        int(target_kv_size * draft_num_layers / target_kv_num_layers)
-                        * draft_loc_space_scale
-                    )
+                    if simt_offload:
+                        # The target cell only charges Indexer KV. The draft
+                        # still has its own full paged latent KV.
+                        per_layer = (
+                            kvc.model_config.kv_lora_rank
+                            + kvc.model_config.qk_rope_head_dim
+                        ) * torch._utils._element_size(kvc.kv_cache_dtype)
+                        draft_kv_size = per_layer * draft_num_layers
+                    else:
+                        draft_kv_size = int(
+                            target_kv_size * draft_num_layers / target_kv_num_layers
+                        )
+                    draft_kv_size *= draft_loc_space_scale
                     # _compute_dsa_indexer_cell_size already applies the
                     # HiSparse logical-space ratio to the draft indexer.
                     draft_indexer_size = self._compute_dsa_indexer_cell_size(

@@ -32,6 +32,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_simt_ops_path,
+    get_simt_verify_width,
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
@@ -391,9 +392,12 @@ class AscendAttnBackend(AttentionBackend):
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
             model_config=model_runner.model_config,
             use_mla_backend=model_runner.use_mla_backend,
+            is_draft_worker=self.is_draft_worker,
         )
         simt_ops_path = get_simt_ops_path(
-            enabled=self.enable_sparsity_driven_kv_offload, dcp_size=self.dcp_size
+            enabled=self.enable_sparsity_driven_kv_offload,
+            dcp_size=self.dcp_size,
+            is_draft_worker=self.is_draft_worker,
         )
         self.sparse_kv_manager = None
         if self.enable_sparsity_driven_kv_offload:
@@ -402,14 +406,23 @@ class AscendAttnBackend(AttentionBackend):
                 register_sparse_kv_manager,
             )
 
-            self.sparse_kv_manager = SparseKVCacheManager(
-                model_runner.req_to_token_pool,
-                model_runner.token_to_kv_pool_allocator,
-                sparse_context_len=get_sparsity_driven_kv_offload_sparse_context_len(
-                    model_config=model_runner.model_config
-                ),
-                simt_ops_path=simt_ops_path,
-            )
+            target_pool = model_runner.token_to_kv_pool
+            if simt_ops_path:
+                self.sparse_kv_manager = getattr(
+                    target_pool, "_simt_sparse_kv_manager", None
+                )
+            if self.sparse_kv_manager is None:
+                self.sparse_kv_manager = SparseKVCacheManager(
+                    model_runner.req_to_token_pool,
+                    model_runner.token_to_kv_pool_allocator,
+                    sparse_context_len=get_sparsity_driven_kv_offload_sparse_context_len(
+                        model_config=model_runner.model_config
+                    ),
+                    simt_ops_path=simt_ops_path,
+                    simt_verify_width=get_simt_verify_width() if simt_ops_path else 1,
+                )
+                if simt_ops_path:
+                    target_pool._simt_sparse_kv_manager = self.sparse_kv_manager
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(
                 "Sparsity-driven KV offload is enabled with manager %s.",
@@ -666,6 +679,16 @@ class AscendAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_target_verify():
             spec_algorithm = forward_batch.spec_algorithm
             if (
+                self.sparse_kv_manager is not None
+                and self.sparse_kv_manager.simt_lru is not None
+            ):
+                # The indexer sees the written verify window, while Plan
+                # independently masks each query to its own causal position.
+                self.forward_metadata.seq_lens = (
+                    forward_batch.seq_lens.int() + forward_batch.spec_info.draft_token_num
+                )
+                self.forward_metadata.seq_lens_cpu_int = None
+            elif (
                 spec_algorithm is None or not spec_algorithm.is_dflash_family()
             ) and self.forward_metadata.seq_lens_cpu_int is not None:
                 self.forward_metadata.seq_lens_cpu_int += int(
@@ -951,7 +974,11 @@ class AscendAttnBackend(AttentionBackend):
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
         metadata = ForwardMetadata()
-        if self.enable_sparsity_driven_kv_offload:
+        simt_offload = (
+            self.sparse_kv_manager is not None
+            and self.sparse_kv_manager.simt_lru is not None
+        )
+        if self.enable_sparsity_driven_kv_offload and not simt_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
                 register_npu_host_callback_stream,
             )
@@ -986,9 +1013,11 @@ class AscendAttnBackend(AttentionBackend):
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
             num_tokens = out_cache_loc.shape[0]
             metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[:num_tokens]
-        if not self.dense_mla_dcp_target:
+        if not self.dense_mla_dcp_target and not simt_offload:
             metadata.seq_lens_cpu_list = seq_lens.cpu().int().tolist()
-        metadata.seq_lens = seq_lens
+        # Verify's DSA metadata is post-write; keep the graph input lengths
+        # (the committed prefix) separate from its mutable indexer bounds.
+        metadata.seq_lens = seq_lens.clone() if simt_offload else seq_lens
         if self.dense_mla_dcp_target and forward_mode.is_target_verify():
             metadata.dcp_mtp_attn_mask = self.graph_metadata["dcp_mtp_attn_mask"][:bs]
         # FIA's Host lengths are captured as lists so graph.update can rebind them.
