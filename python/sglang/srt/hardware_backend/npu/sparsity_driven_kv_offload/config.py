@@ -11,7 +11,14 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attention_backends, get_schedule
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_disagg,
+    get_exec,
+    get_memory,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
@@ -108,3 +115,41 @@ def get_sparsity_driven_kv_offload_cell_size(
     else:
         num_indexer_layers = num_layers
     return index_head_dim * num_indexer_layers * element_size
+
+
+def get_simt_ops_path(*, enabled: bool, dcp_size: int) -> str:
+    """Validate the initial resident-KV integration before allocating the pool."""
+    path = envs.SGLANG_NPU_SPARSE_KV_SIMT_OPS_PATH.get()
+    if not path:
+        return ""
+    if not enabled:
+        raise ValueError(
+            "A5 SIMT sparse KV requires SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD=1"
+        )
+
+    import torch
+
+    from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    device_name = torch.npu.get_device_name(torch.npu.current_device())
+    soc_name = device_name.replace(" ", "").lower().removeprefix("ascend")
+    if not soc_name.startswith("950") or soc_name.startswith("950dt"):
+        raise ValueError(
+            f"A5 SIMT sparse KV requires a 950 device with ACL Host mapping, got {device_name}"
+        )
+    if get_disagg().disaggregation_mode != "null" or get_spec().speculative_algorithm:
+        raise ValueError(
+            "A5 SIMT sparse KV currently requires colocated, non-speculative decode"
+        )
+    if dcp_size > 1 or is_dsa_enable_prefill_cp():
+        raise ValueError("A5 SIMT sparse KV currently requires context parallelism disabled")
+    if not get_memory().disable_radix_cache:
+        raise ValueError("A5 SIMT sparse KV currently requires --disable-radix-cache")
+    graph = get_exec().graph.cuda_graph_config
+    if (
+        graph.decode.backend != Backend.DISABLED
+        or graph.prefill.backend != Backend.DISABLED
+    ):
+        raise ValueError("A5 SIMT sparse KV currently requires eager prefill and decode")
+    return path

@@ -115,6 +115,12 @@ def forward_sparsity_driven_kv_offload(
             actual_seq_qlen,
             actual_seq_lengths_kv,
         )
+    elif (
+        forward_batch.forward_mode.is_decode() and sparse_kv_manager.simt_lru is not None
+    ):
+        return _forward_simt_decode(
+            backend, layer, forward_batch, q_nope, q_pe, topk_indices
+        )
     elif forward_batch.forward_mode.is_decode():
         batch_size = forward_batch.batch_size
         num_kv_heads = layer.tp_k_head_num
@@ -316,3 +322,49 @@ def forward_sparsity_driven_kv_offload(
         )
 
     return attn_out
+
+
+def _forward_simt_decode(backend, layer, forward_batch, q_nope, q_pe, topk_indices):
+    manager = _get_sparse_kv_manager(backend)
+    lru = manager.simt_lru
+    rows = forward_batch.batch_size
+    resident_nope, resident_rope, slots = lru.plan_and_load(
+        layer.layer_id - manager.start_layer,
+        forward_batch,
+        normalize_batch_topk_indices(topk_indices),
+    )
+
+    # Plan already checked causal visibility. Indices now address physical
+    # resident slots; the KV length in BSND bounds that storage, not the prompt.
+    # A5 SFA stops at -1. Plan can leave holes when it rejects an input
+    # position, so pack valid slots in Indexer order and leave a -1 suffix.
+    valid = slots >= 0
+    ranks = valid.cumsum(dim=1)
+    valid_count = ranks[:, -1:]
+    destinations = torch.where(
+        valid, ranks - 1, lru.topk_positions - ranks + valid_count
+    )
+    sparse_indices = torch.empty_like(slots).scatter_(1, destinations, slots)
+    empty = valid_count.squeeze(1) == 0
+    sparse_indices[:, 0] = torch.where(empty, 0, sparse_indices[:, 0])
+    ret = torch_npu.npu_sparse_flash_attention(
+        q_nope.reshape(rows, 1, -1, backend.kv_lora_rank),
+        resident_nope,
+        resident_nope,
+        sparse_indices.view(rows, 1, 1, lru.topk),
+        layer.scaling,
+        actual_seq_lengths_query=lru.query_lens[:rows],
+        actual_seq_lengths_kv=lru.slot_lens[:rows],
+        query_rope=q_pe.reshape(rows, 1, -1, backend.qk_rope_head_dim),
+        key_rope=resident_rope,
+        sparse_block_size=1,
+        layout_query="BSND",
+        layout_kv="BSND",
+        sparse_mode=0,
+        attention_mode=2,
+        return_softmax_lse=False,
+    )
+    out = ret[0] if isinstance(ret, tuple) else ret
+    out = out[:, :, : layer.tp_q_head_num, :]
+    out = out.reshape(rows, layer.tp_q_head_num * backend.kv_lora_rank)
+    return out.masked_fill(empty.unsqueeze(1), 0)

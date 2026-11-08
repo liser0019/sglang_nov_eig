@@ -31,6 +31,7 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_mla_preprocess_enabled,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    get_simt_ops_path,
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
@@ -391,6 +392,9 @@ class AscendAttnBackend(AttentionBackend):
             model_config=model_runner.model_config,
             use_mla_backend=model_runner.use_mla_backend,
         )
+        simt_ops_path = get_simt_ops_path(
+            enabled=self.enable_sparsity_driven_kv_offload, dcp_size=self.dcp_size
+        )
         self.sparse_kv_manager = None
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
@@ -404,6 +408,7 @@ class AscendAttnBackend(AttentionBackend):
                 sparse_context_len=get_sparsity_driven_kv_offload_sparse_context_len(
                     model_config=model_runner.model_config
                 ),
+                simt_ops_path=simt_ops_path,
             )
             register_sparse_kv_manager(self.sparse_kv_manager)
             logger.info(

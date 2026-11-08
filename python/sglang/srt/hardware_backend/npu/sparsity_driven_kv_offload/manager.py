@@ -75,6 +75,7 @@ class SparseKVCacheManager:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         sparse_context_len: int,
+        simt_ops_path: str = "",
     ) -> None:
         enable_memory_saver = False
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -110,6 +111,64 @@ class SparseKVCacheManager:
         )
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
+        if simt_ops_path and (
+            self.store_dtype != torch.bfloat16
+            or getattr(paged_kv_cache, "rope_dtype", self.store_dtype) != torch.bfloat16
+        ):
+            raise ValueError("A5 SIMT sparse KV currently requires BF16 NoPE and RoPE")
+        self.simt_lru = None
+        if simt_ops_path:
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.simt_lru import (
+                SparseKVSimtLRU,
+                load_simt_ops,
+            )
+
+            load_simt_ops(simt_ops_path)
+        else:
+            self._init_compact_cache(memory_saver_adapter)
+
+        # Host KV buffer
+        # [bs, ctx_len, head_num, head_dim] for each layer
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        self.host_kv_buffer: list[torch.Tensor] = []
+        self.host_ptr_list: list[int] = []
+        self.dev_ptr_list: list[int] = []
+
+        host_kv_shape = (
+            self.size,
+            self.max_context_len,
+            self.head_num,
+            self.head_dim,
+        )
+        logger.info("Sparse KV host buffer shape: %s", host_kv_shape)
+        device_id = torch.npu.current_device()
+
+        try:
+            for layer_idx in range(self.layer_num):
+                shm_cpu_tensor, host_ptr, dev_ptr = create_shm_tensor(
+                    shape=host_kv_shape,
+                    dtype=self.store_dtype,
+                    device_id=device_id,
+                    name=f"host_kv_layer_{layer_idx}_rank_{device_id}",
+                )
+                self.host_kv_buffer.append(shm_cpu_tensor)
+                self.host_ptr_list.append(host_ptr)
+                self.dev_ptr_list.append(dev_ptr)
+        except Exception as e:
+            self._raise_buffer_allocation_error("host_kv_buffer", e)
+        self.host_kv_ctx_len = torch.zeros(
+            (self.size, self.max_context_len), dtype=torch.int32, device="cpu"
+        )
+        self.topk_indices_cpu = None
+        self.token_on_device_cpu = None
+        self.device_token_pos_cpu = None
+        self.current_req_indices_cpu = None
+
+        if simt_ops_path:
+            self.simt_lru = SparseKVSimtLRU(self)
+        self._install_req_alloc_hook(req_to_token_pool)
+
+    def _init_compact_cache(self, memory_saver_adapter) -> None:
         self._materialize_d2d_hit_stream = torch.npu.Stream()
         self._materialize_h2d_miss_stream = torch.npu.Stream()
         self._materialize_refill_stream = torch.npu.Stream()
@@ -120,7 +179,11 @@ class SparseKVCacheManager:
         self.refill_done = torch.npu.Event()
         self.slot_map_done = torch.npu.Event()
 
-        # device KV buffer
+        self._device_cache_slot_ids = torch.arange(
+            self.sparse_context_len, dtype=torch.long, device=self.device
+        )
+        self._slot_map_width = (self.max_context_len // 8 + 1) * 8
+
         try:
             with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
                 # [bs, ctx_len, head_num, head_dim] for each layer
@@ -166,50 +229,6 @@ class SparseKVCacheManager:
         except Exception as e:
             self._raise_buffer_allocation_error("device_slot_map", e)
 
-        # Host KV buffer
-        # [bs, ctx_len, head_num, head_dim] for each layer
-        # The padded slot 0 is used for writing dummy outputs from padded tokens.
-        self.host_kv_buffer: list[torch.Tensor] = []
-        self.host_ptr_list: list[int] = []
-        self.dev_ptr_list: list[int] = []
-
-        host_kv_shape = (
-            self.size,
-            self.max_context_len,
-            self.head_num,
-            self.head_dim,
-        )
-        logger.info("Sparse KV host buffer shape: %s", host_kv_shape)
-        device_id = torch.npu.current_device()
-
-        try:
-            for layer_idx in range(self.layer_num):
-                shm_cpu_tensor, host_ptr, dev_ptr = create_shm_tensor(
-                    shape=host_kv_shape,
-                    dtype=self.store_dtype,
-                    device_id=device_id,
-                    name=f"host_kv_layer_{layer_idx}_rank_{device_id}",
-                )
-                self.host_kv_buffer.append(shm_cpu_tensor)
-                self.host_ptr_list.append(host_ptr)
-                self.dev_ptr_list.append(dev_ptr)
-        except Exception as e:
-            self._raise_buffer_allocation_error("host_kv_buffer", e)
-        self.host_kv_ctx_len = torch.zeros(
-            (self.size, self.max_context_len), dtype=torch.int32, device="cpu"
-        )
-        self.topk_indices_cpu = None
-        self.token_on_device_cpu = None
-        self.device_token_pos_cpu = None
-        self.current_req_indices_cpu = None
-
-        self._device_cache_slot_ids = torch.arange(
-            self.sparse_context_len, dtype=torch.long, device=self.device
-        )
-        self._slot_map_width = (self.max_context_len // 8 + 1) * 8
-
-        self._install_req_alloc_hook(req_to_token_pool)
-
     def _raise_buffer_allocation_error(
         self,
         buffer_name: str,
@@ -243,6 +262,9 @@ class SparseKVCacheManager:
         req_ids_tensor = torch.tensor(
             req_ids, dtype=torch.long, device=self.device
         ).contiguous()
+        if self.simt_lru is not None:
+            self.simt_lru.reset_requests(req_ids_tensor)
+            return
         for layer_idx in range(self.layer_num):
             self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
 
@@ -429,10 +451,14 @@ class SparseKVCacheManager:
                 )
 
             dst_index = (req_ids * self.max_context_len + token_pos).contiguous()
+            valid_req = (
+                (req_ids > 0) & (req_ids < self.size)
+                if self.simt_lru is not None
+                else (forward_batch.seq_lens != 1) & (req_ids >= 0)
+            )
             valid_mask = (
-                (forward_batch.seq_lens != 1)
+                valid_req
                 & (cache_loc >= 0)
-                & (req_ids >= 0)
                 & (token_pos >= 0)
                 & (token_pos < self.max_context_len)
             ).contiguous()
