@@ -145,11 +145,28 @@ def simt_plan_storage(topk: int, verify_width: int) -> tuple[int, int]:
     return capacity, scratch if ((scratch * 4 + 31) & ~31) > 112 * 1024 else 0
 
 
+def get_simt_max_rows(request_slots: int, verify_width: int) -> int:
+    from sglang.srt.layers.dp_attention import (
+        get_cuda_graph_max_batch_size,
+        get_eager_max_batch_size,
+    )
+
+    # The request pool includes dummy slot 0. Batch padding can need more
+    # query rows than real request slots, especially for small TP batches.
+    requests = max(1, request_slots - 1)
+    padded_requests = max(
+        request_slots,
+        get_eager_max_batch_size(requests),
+        get_cuda_graph_max_batch_size(requests),
+    )
+    return padded_requests * verify_width
+
+
 def get_simt_resident_budget(model_config, num_layers, request_slots) -> int:
     width = get_simt_verify_width()
     topk = get_sparsity_driven_kv_offload_sparse_context_len(model_config=model_config)
     capacity, scratch = simt_plan_storage(topk, width)
-    rows = request_slots * width
+    rows = get_simt_max_rows(request_slots, width)
     kv_bytes = (model_config.kv_lora_rank + model_config.qk_rope_head_dim) * 2
     # Per-layer resident KV, reverse map, LRU, row mode and request generation.
     per_layer = rows * (capacity * (kv_bytes + 8) + 12) + 16

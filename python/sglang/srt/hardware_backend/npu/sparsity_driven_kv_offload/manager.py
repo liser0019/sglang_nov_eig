@@ -254,9 +254,7 @@ class SparseKVCacheManager:
         ) from exc
 
     def init_req(self, req: Req) -> None:
-        if req.is_chunked > 0:
-            return
-        rid = req.req_pool_idx
+        rid = req.kv.req_pool_idx
         if rid is None:
             raise RuntimeError(
                 "Cannot initialize sparse KV state before allocating a request pool slot"
@@ -279,25 +277,20 @@ class SparseKVCacheManager:
             self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
 
     def _install_req_alloc_hook(self, req_to_token_pool: ReqToTokenPool) -> None:
-        original_alloc = getattr(
-            req_to_token_pool, "_sparse_kv_original_alloc", req_to_token_pool.alloc
+        original_alloc_rows = getattr(
+            req_to_token_pool,
+            "_sparse_kv_original_alloc_rows",
+            req_to_token_pool.alloc_rows,
         )
-        setattr(req_to_token_pool, "_sparse_kv_original_alloc", original_alloc)
+        setattr(req_to_token_pool, "_sparse_kv_original_alloc_rows", original_alloc_rows)
 
-        def alloc_with_sparse_reset(reqs: list[Req]) -> Optional[List[int]]:
-            newly_allocated = [req.req_pool_idx is None for req in reqs]
-            req_pool_indices = original_alloc(reqs)
-            if req_pool_indices is not None:
-                self.reset_requests(
-                    [
-                        req_pool_indices[i]
-                        for i, is_new in enumerate(newly_allocated)
-                        if is_new
-                    ]
-                )
-            return req_pool_indices
+        def alloc_rows_with_sparse_reset(need_size: int) -> Optional[List[int]]:
+            rows = original_alloc_rows(need_size)
+            if rows:
+                self.reset_requests(rows)
+            return rows
 
-        setattr(req_to_token_pool, "alloc", alloc_with_sparse_reset)
+        setattr(req_to_token_pool, "alloc_rows", alloc_rows_with_sparse_reset)
 
     def offload(
         self,

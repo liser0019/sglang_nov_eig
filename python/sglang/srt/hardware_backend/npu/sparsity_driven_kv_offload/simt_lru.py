@@ -9,6 +9,7 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     SIMT_KV_PAGE_SIZE,
+    get_simt_max_rows,
     simt_plan_storage,
 )
 
@@ -51,7 +52,7 @@ class _LayerState:
 class SparseKVSimtLRU:
     def __init__(self, manager, verify_width: int):
         self.size = manager.size
-        self.max_rows = self.size * verify_width
+        self.max_rows = get_simt_max_rows(self.size, verify_width)
         self.verify_width = verify_width
         self.topk = manager.sparse_context_len
         self.block_size = SIMT_KV_PAGE_SIZE
