@@ -215,7 +215,7 @@ def get_simt_ops_path(
 
     device_name = torch.npu.get_device_name(torch.npu.current_device())
     soc_name = device_name.replace(" ", "").lower().removeprefix("ascend")
-    if not soc_name.startswith("950") or soc_name.startswith("950dt"):
+    if not soc_name.startswith("950"):
         raise ValueError(
             f"A5 SIMT sparse KV requires a 950 device with ACL Host mapping, got {device_name}"
         )

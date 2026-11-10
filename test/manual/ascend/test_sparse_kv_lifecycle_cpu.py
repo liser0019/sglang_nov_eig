@@ -223,5 +223,80 @@ class TestPaddedRows(unittest.TestCase):
         )
 
 
+class TestA5DeviceGate(unittest.TestCase):
+    def setUp(self):
+        self.device_name = "Ascend950PR"
+        backend = SimpleNamespace(DISABLED="disabled", FULL="full")
+        modules = {}
+        torch = ModuleType("torch")
+        torch.npu = SimpleNamespace(
+            current_device=lambda: 0,
+            get_device_name=lambda device: self.device_name,
+        )
+        modules["torch"] = torch
+        for name, attr, value in (
+            (
+                "sglang.srt.hardware_backend.npu.attention.mla_preprocess",
+                "is_mla_preprocess_enabled",
+                lambda: False,
+            ),
+            (
+                "sglang.srt.layers.attention.dsa.utils",
+                "is_dsa_enable_prefill_cp",
+                lambda: False,
+            ),
+            ("sglang.srt.model_executor.cuda_graph_config", "Backend", backend),
+        ):
+            module = ModuleType(name)
+            setattr(module, attr, value)
+            modules[name] = module
+        module_patch = patch.dict("sys.modules", modules)
+        module_patch.start()
+        self.addCleanup(module_patch.stop)
+        memory = SimpleNamespace(
+            enable_unified_memory=False,
+            enable_hisparse=False,
+            enable_hierarchical_cache=False,
+            disable_radix_cache=True,
+        )
+        graph = SimpleNamespace(
+            enable_torch_compile=False,
+            cuda_graph_config=SimpleNamespace(
+                decode=SimpleNamespace(backend=backend.FULL),
+                prefill=SimpleNamespace(backend=backend.DISABLED),
+            ),
+        )
+        functions = load_definitions(
+            ROOT / OFFLOAD / "config.py",
+            {"get_simt_ops_path"},
+            {
+                "envs": SimpleNamespace(
+                    SGLANG_NPU_SPARSE_KV_SIMT_OPS_PATH=SimpleNamespace(
+                        get=lambda: "/tmp/ops.so"
+                    )
+                ),
+                "get_disagg": lambda: SimpleNamespace(disaggregation_mode="null"),
+                "get_simt_verify_width": lambda: 1,
+                "get_memory": lambda: memory,
+                "get_exec": lambda: SimpleNamespace(graph=graph),
+            },
+        )
+        self.ops_path = functions["get_simt_ops_path"]
+
+    def test_pr_and_dt_pass_the_device_gate(self):
+        for name in ("Ascend950PR", "Ascend 950DT", "Ascend950"):
+            with self.subTest(name=name):
+                self.device_name = name
+                self.assertEqual(
+                    self.ops_path(enabled=True, dcp_size=1, is_draft_worker=False),
+                    "/tmp/ops.so",
+                )
+
+    def test_other_architecture_stays_rejected(self):
+        self.device_name = "Ascend910_9391"
+        with self.assertRaisesRegex(ValueError, "requires a 950 device"):
+            self.ops_path(enabled=True, dcp_size=1, is_draft_worker=False)
+
+
 if __name__ == "__main__":
     unittest.main()
