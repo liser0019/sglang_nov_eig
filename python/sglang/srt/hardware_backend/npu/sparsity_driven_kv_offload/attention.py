@@ -345,10 +345,9 @@ def _forward_simt_decode(
     )
     rows = slots.shape[0]
 
-    # Plan already checked causal visibility. Indices now address physical
-    # resident slots; the length bounds the resident storage for each query.
-    # A5 SFA stops at -1. Plan can leave holes when it rejects an input
-    # position, so pack valid slots in Indexer order and leave a -1 suffix.
+    # Plan already checked causal visibility. Indices address resident slots.
+    # Pack valid slots in Indexer order; Plan may leave holes when rejecting
+    # positions. A5 SFA uses the packed valid count as its KV computation length.
     valid = slots >= 0
     ranks = valid.cumsum(dim=1)
     valid_count = ranks[:, -1:]
@@ -369,7 +368,9 @@ def _forward_simt_decode(
         sparse_indices.unsqueeze(1),
         layer.scaling,
         actual_seq_lengths_query=lru.cu_query_lens[:rows],
-        actual_seq_lengths_kv=lru.slot_lens[:rows],
+        actual_seq_lengths_kv=(
+            valid_count.squeeze(1).clamp(min=1).to(torch.int32).contiguous()
+        ),
         block_table=lru.resident_blocks[:rows],
         query_rope=q_pe[:rows].reshape(rows, -1, backend.qk_rope_head_dim),
         key_rope=rope_pages,
